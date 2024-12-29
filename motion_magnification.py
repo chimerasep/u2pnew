@@ -38,6 +38,7 @@ import numpy as np
 from PIL import Image
 import cv2
 import torch
+import traceback
 
 from steerable_pyramid import SteerablePyramid, SuboctaveSP
 from phase_based_processing import PhaseBased
@@ -178,7 +179,7 @@ if __name__ == '__main__':
         print(f"\nSave Directory not found, " \
                "using default input video directory instead \n")
     
-    video_name = re.search("\w*(?=\.\w*)", video_path).group()
+    video_name = re.search(r"\w*(?=\.\w*)", video_path).group()
     video_output = f"{video_name}_{colorspace}_{int(phase_mag)}x.mp4"
     video_save_path = os.path.join(save_directory, video_output)
 
@@ -278,9 +279,13 @@ if __name__ == '__main__':
 
     # get Complex Steerabel Pyramid Filters
     filters, crops = csp.get_filters(h, w, cropped=False)
-    filters_tensor = torch.tensor(np.array(filters)).type(torch.float32) \
-                                                    .to(DEVICE)
-    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Stack filters into a single tensor instead of keeping as list
+    filters_tensor = torch.stack([torch.tensor(f, dtype=torch.float32) for f in filters]).to(device)
+
+    print(f"Number of filters: {filters_tensor.shape[0]}")
+    print(f"Filter shape: {filters_tensor.shape[1:]}")
+
     # TODO: ensure selected Batch Size is compatible with the number of filters
     # we don't want to rely on zero padding
     if (filters_tensor.shape[0] % batch_size) != 0:
@@ -382,7 +387,7 @@ if __name__ == '__main__':
     if save_gif:
         
         # replace video extension with ".gif"
-        gif_save_path = re.sub("\.\w+(?<=\w)", ".gif", video_save_path)
+        gif_save_path = re.sub(r"\.\w+(?<=\w)", ".gif", video_save_path)
 
         print(f"Saving GIF to: {gif_save_path} \n")
 
@@ -415,62 +420,87 @@ if __name__ == '__main__':
     print("Motion Magnification processing complete! \n")
     print(f"Time Elapsed (HH:MM:SS): {time_elapsed} \n")
     
-def motion_magnification(image, phase_mag=5.0, freq_lo=0.2, freq_hi=0.25, colorspace='luma3', sigma=2.0, attenuate=False):
+def motion_magnification(image, phase_mag=25.0, freq_lo=0.2, freq_hi=0.25, colorspace='luma3', sigma=2.0, attenuate=False):
     """
     Apply phase-based motion magnification on a single image.
     """
-    # Convert the image to the proper colorspace first
-    if colorspace == "luma3":
-        # Convert BGR to YCrCb and take Y channel
-        image_y = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-        y_channel = image_y[:, :, 0]
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         
-        # Convert to tensor and add batch dimension
-        image_tensor = torch.tensor(y_channel).float().unsqueeze(0).to(DEVICE)
-        
-        # Get image dimensions
-        h, w = image.shape[:2]
-        
-        # Initialize steerable pyramid
-        max_depth = int(np.floor(np.log2(np.min(np.array((w, h))))) - 2)
-        csp = SteerablePyramid(
-            depth=max_depth,
-            orientations=8,
-            filters_per_octave=2,
-            twidth=0.75,
-            complex_pyr=True
-        )
-        
-        # Get filters
-        filters, crops = csp.get_filters(h, w, cropped=False)
-        filters_tensor = torch.tensor(np.array(filters)).type(torch.float32).to(DEVICE)
-        
-        # Get transfer function
-        transfer_function = bandpass_filter(freq_lo, freq_hi, 30.0, 1, DEVICE)  # Assuming 30fps
-        
-        # Initialize phase-based processor
-        pb = PhaseBased(sigma, transfer_function, phase_mag, attenuate, 0, 1, DEVICE, EPS)
-        
-        # Process the frame
-        # Get FFT of the frame
-        video_dft = get_fft2_batch(image_tensor).to(DEVICE)
-        
-        # Process the frame
-        result_tensor = pb.process_single_channel(image_tensor, filters_tensor, video_dft)
-        
-        # Convert result back to numpy
-        processed_y = result_tensor.cpu().numpy()
-        
-        # Normalize the Y channel result
-        processed_y = np.clip(processed_y, 0, 255).astype(np.uint8)
-        
-        # Combine with original Cr and Cb channels
-        result_ycrcb = image_y.copy()
-        result_ycrcb[:, :, 0] = processed_y
-        
-        # Convert back to BGR
-        processed_image = cv2.cvtColor(result_ycrcb, cv2.COLOR_YCrCb2BGR)
-        
-        return processed_image
-    else:
-        raise ValueError(f"Unsupported colorspace: {colorspace}")
+        if colorspace == "luma3":
+            # Convert BGR to YCrCb and take Y channel
+            image_y = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+            y_channel = image_y[:, :, 0]
+            
+            # Convert to tensor and move to GPU if available
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            image_tensor = torch.tensor(y_channel, dtype=torch.float32).to(device)
+            
+            # Add batch dimension if needed
+            if len(image_tensor.shape) == 2:
+                image_tensor = image_tensor.unsqueeze(0)
+            
+            print(f"Tensor shape before processing: {image_tensor.shape}")
+            
+            # Get image dimensions
+            h, w = image.shape[:2]
+            
+            try:
+                # Initialize steerable pyramid
+                max_depth = int(np.floor(np.log2(np.min(np.array((w, h))))) - 2)
+                csp = SteerablePyramid(
+                    depth=max_depth,
+                    orientations=8,
+                    filters_per_octave=2,
+                    twidth=0.75,
+                    complex_pyr=True
+                )
+                
+                # Get filters and move to GPU
+                filters, crops = csp.get_filters(h, w, cropped=False)
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                # Stack filters into a single tensor instead of keeping as list
+                filters_tensor = torch.stack([torch.tensor(f, dtype=torch.float32) for f in filters]).to(device)
+
+                print(f"Number of filters: {filters_tensor.shape[0]}")
+                print(f"Filter shape: {filters_tensor.shape[1:]}")
+                
+                # Get transfer function
+                transfer_function = bandpass_filter(freq_lo, freq_hi, 30.0, 1, device)
+                
+                # Initialize phase-based processor
+                pb = PhaseBased(sigma, transfer_function, phase_mag, attenuate, 0, 1, device, EPS)
+                
+                # Compute DFT of the input image
+                video_dft = get_fft2_batch(image_tensor).to(device)
+                
+                # Now pass the video_dft to process_single_channel
+                result_tensor = pb.process_single_channel(image_tensor, filters_tensor, video_dft)
+                
+                # Move result back to CPU and convert to numpy
+                result_tensor = result_tensor.cpu()
+                processed_y = result_tensor.squeeze().numpy()
+                
+                # Normalize the Y channel result
+                processed_y = np.clip(processed_y, 0, 255).astype(np.uint8)
+                
+                # Combine with original Cr and Cb channels
+                result_ycrcb = image_y.copy()
+                result_ycrcb[:, :, 0] = processed_y
+                
+                # Convert back to BGR
+                processed_image = cv2.cvtColor(result_ycrcb, cv2.COLOR_YCrCb2BGR)
+                
+                return processed_image
+                
+            except Exception as e:
+                print(f"Processing error: {str(e)}")
+                traceback.print_exc()
+                return image
+                
+    except Exception as e:
+        print(f"General error: {str(e)}")
+        traceback.print_exc()
+        return image
